@@ -222,6 +222,9 @@ fn main() {
     // ==========================================
     // 7. إطلاق المحرك
     // ==========================================
+    // ==========================================
+    // 7. إطلاق المحرك
+    // ==========================================
     let mut cmd_chain = Vec::new();
     if selection.contains("Zenith Performance") { cmd_chain.push("gamemoderun"); }
     if selection.contains("Performance Overlay") { cmd_chain.push("mangohud"); cmd_chain.push("--dlsym"); }
@@ -231,9 +234,11 @@ fn main() {
     let mut final_cmd = Command::new(cmd_chain[0]);
     if cmd_chain.len() > 1 { final_cmd.args(&cmd_chain[1..]); }
 
+    // --- الإضافة هنا لاستخدام game_dir ---
+    final_cmd.current_dir(game_dir);
+
     println!("🔥 Split VMAX: Launching {} | Target FPS: {}", game_name, if fps_limit == "0" { "MAX/UNLOCKED" } else { &fps_limit });
     let _ = final_cmd.envs(env_vars).status();
-}
 
 // --- وظائف الأنظمة الفرعية ---
 
@@ -285,4 +290,5 @@ fn active_thermal_guard(home: &str) {
         thread::sleep(Duration::from_secs(30));
     }
 
+}
 }
