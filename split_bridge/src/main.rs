@@ -7,6 +7,35 @@ use std::os::unix::fs::symlink;
 use std::thread;
 use std::time::Duration;
 
+fn detect_gpu_vendor() -> String {
+    let output = Command::new("sh")
+    .arg("-c")
+    .arg("lspci | grep -E 'VGA|Display'")
+    .output()
+    .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase())
+    .unwrap_or_default();
+
+    if output.contains("intel") {
+        "intel".to_string()
+    } else if output.contains("amd") || output.contains("ati") {
+        "amd".to_string()
+    } else if output.contains("nvidia") {
+        "nvidia".to_string()
+    } else {
+        "generic".to_string()
+    }
+}
+fn get_intel_gpu_id() -> String {
+    // هذا الأمر يستخرج المعرف بصيغة vendor:device (مثلاً 8086:1916)
+    let output = Command::new("sh")
+    .arg("-c")
+    .arg("lspci -nn | grep -E 'VGA|Display' | grep -oP '\\[\\K[0-9a-f]{4}:[0-9a-f]{4}(?=\\])'")
+    .output()
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    .unwrap_or_default();
+
+    output
+}
 // ==========================================
 // 0. نظام التسجيل (The Black Box Logger)
 // ==========================================
@@ -110,13 +139,11 @@ fn main() {
     // ==========================================
     // 5. هندسة البيئة (Environment Logic)
     // ==========================================
-    env::set_current_dir(game_dir).unwrap_or(());
+    let gpu_vendor = detect_gpu_vendor();
     let mut env_vars: Vec<(&str, String)> = vec![
         ("WINEFSYNC", "1".to_string()),
         ("DXVK_ASYNC", "1".to_string()),
-        ("DRI_PRIME", "0".to_string()),
-        ("MESA_LOADER_DRIVER_OVERRIDE", "iris".to_string()),
-        ("vblank_mode", "0".to_string()), // كسر قيد VSync للوصول لأعلى فريمات
+        ("vblank_mode", "0".to_string()),
         ("DXVK_FRAME_RATE", fps_limit.clone()),
     ];
 
@@ -132,11 +159,38 @@ fn main() {
     }
 
     // استخدام is_heavy لتفعيل Vulkan الصارم للألعاب المتطلبة
-    if selection.contains("Force Vulkan Strict Mode") || is_heavy {
-        vmax_log("Smart Detection: Activating High-Performance Vulkan Bridge.", &home);
-        env_vars.push(("MESA_VK_DEVICE_SELECT", "8086:1916".to_string()));
-        env_vars.push(("VK_ICD_FILENAMES", "/usr/share/vulkan/icd.d/intel_icd.x86_64.json".to_string()));
-        env_vars.push(("WINEDLLOVERRIDES", "d3d11,dxgi,d3d9=n,b".to_string()));
+    match gpu_vendor.as_str() {
+        "intel" => {
+            env_vars.push(("MESA_LOADER_DRIVER_OVERRIDE", "iris".to_string()));
+            if is_heavy || selection.contains("Force Vulkan Strict Mode") {
+                let intel_id = get_intel_gpu_id(); // جلب المعرف الحقيقي للجهاز الحالي
+                if !intel_id.is_empty() {
+                    env_vars.push(("MESA_VK_DEVICE_SELECT", intel_id));
+                }
+                env_vars.push(("WINEDLLOVERRIDES", "d3d11,dxgi,d3d9=n,b".to_string()));
+            }
+        },
+        "amd" => {
+            env_vars.push(("MESA_LOADER_DRIVER_OVERRIDE", "radeonsi".to_string()));
+            env_vars.push(("RADV_PERFTEST", "aco".to_string())); // تحسين خاص بكروت AMD
+        },
+        "nvidia" => {
+            // إجبار الكرت على استخدام الطاقة الكاملة (Power Mizer)
+            env_vars.push(("__GL_GSYNC_ALLOWED", "1".to_string()));
+            env_vars.push(("__GL_MAX_FRAMES_ALLOWED", "1".to_string()));
+
+            // تقليل الـ Stuttering في ألعاب الـ OpenGL
+            env_vars.push(("__GL_THREADED_OPTIMIZATIONS", "1".to_string()));
+
+            // في Nvidia، تعريف الفولكان يتم تلقائياً عبر الملفات المثبتة في النظام
+            // لذا لا نحتاج لـ MESA_VK_DEVICE_SELECT
+            vmax_log("Nvidia Detected: Applying High-Performance Force-Sync.", &home);
+            if gpu_vendor == "nvidia" && is_heavy {
+                env_vars.push(("PROXY_NVAPI", "1".to_string()));
+                env_vars.push(("DXVK_ENABLE_NVAPI", "1".to_string()));
+            }
+        },
+        _ => { /* نترك النظام يختار التعريف الافتراضي للبقية */ }
     }
 
     // ==========================================
@@ -230,4 +284,5 @@ fn active_thermal_guard(home: &str) {
         }
         thread::sleep(Duration::from_secs(30));
     }
+
 }
