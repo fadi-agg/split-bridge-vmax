@@ -1,294 +1,553 @@
 use std::env;
-use std::process::{self, Command};
+use std::process::Command;
 use std::path::Path;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::symlink;
-use std::thread;
-use std::time::Duration;
+use std::io::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-fn detect_gpu_vendor() -> String {
-    let output = Command::new("sh")
-    .arg("-c")
-    .arg("lspci | grep -E 'VGA|Display'")
-    .output()
-    .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase())
-    .unwrap_or_default();
+// =====================================================================
+// Split — Performance Gaming Launcher (Hybrid Core)
+// =====================================================================
 
-    if output.contains("intel") {
-        "intel".to_string()
-    } else if output.contains("amd") || output.contains("ati") {
-        "amd".to_string()
-    } else if output.contains("nvidia") {
-        "nvidia".to_string()
-    } else {
-        "generic".to_string()
-    }
+fn log(msg: &str, home: &str) {
+    let path = format!("{}/.split.log", home);
+    let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) else { return };
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let _ = writeln!(f, "[{}] {}", ts, msg);
 }
-fn get_intel_gpu_id() -> String {
-    // هذا الأمر يستخرج المعرف بصيغة vendor:device (مثلاً 8086:1916)
-    let output = Command::new("sh")
-    .arg("-c")
-    .arg("lspci -nn | grep -E 'VGA|Display' | grep -oP '\\[\\K[0-9a-f]{4}:[0-9a-f]{4}(?=\\])'")
-    .output()
-    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-    .unwrap_or_default();
 
-    output
+// ─────────────────────────────────────────────
+// HARDWARE DETECTION
+// ─────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+enum GpuVendor { Intel, Amd, Nvidia, Generic }
+
+#[derive(Debug, Clone, PartialEq)]
+enum Profile { Potato, Mid, High }
+
+#[derive(Debug, Clone)]
+struct HwInfo {
+    gpu_vendor:  GpuVendor,
+    vram_mb:     u64,
+    is_igpu:     bool,
+    cpu_threads: u32,
+    cpu_mhz:     u32,
+    ram_mb:      u64,
 }
-// ==========================================
-// 0. نظام التسجيل (The Black Box Logger)
-// ==========================================
-fn vmax_log(msg: &str, home: &str) {
-    let log_path = format!("{}/.split_vmax.log", home);
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
-        let timestamp = Command::new("date").arg("+%Y-%m-%d %H:%M:%S").output().ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-        let _ = writeln!(file, "[{}] {}", timestamp, msg);
+
+fn detect_hw() -> HwInfo {
+    HwInfo {
+        gpu_vendor:  detect_gpu_vendor(),
+        vram_mb:     detect_vram_mb(),
+        is_igpu:     detect_is_igpu(),
+        cpu_threads: detect_cpu_threads(),
+        cpu_mhz:     detect_cpu_mhz(),
+        ram_mb:      detect_ram_mb(),
     }
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    let home = env::var("HOME").expect("HOME not found");
-    let user = env::var("USER").expect("USER not found");
-    let split_root = format!("{}/split_bridge", home);
-
-    vmax_log("--- VMAX Engine Started ---", &home);
-
-    // ==========================================
-    // 1. نظام التحديث الموحد
-    // ==========================================
-    if args.contains(&"update".to_string()) {
-        println!("🚀 Split Engine Master vMAX: Rebuilding Hybrid Core...");
-        let build_rust = format!(
-            "cd {} && cargo build --release && pkexec install -m 755 target/release/split_bridge /usr/local/bin/split",
-            split_root
-        );
-        let _ = Command::new("fish").arg("-c").arg(build_rust).status();
-        vmax_log("System Updated Successfully.", &home);
-        return;
-    }
-
-    // ==========================================
-    // 2. تحليل المسار وتحديد نوع اللعبة (is_heavy)
-    // ==========================================
-    let mut exe_path_raw = String::new();
-    for arg in args.iter().skip(1) {
-        if arg != "gpu" && arg != "update" { exe_path_raw = arg.clone(); break; }
-    }
-
-    if exe_path_raw.is_empty() {
-        vmax_log("Error: Launch failed, no path provided.", &home);
-        process::exit(1);
-    }
-
-    let exe_path = Path::new(&exe_path_raw);
-    let exe_name = match exe_path.file_name().and_then(|n| n.to_str()) {
-        Some(name) => name,
-        None => process::exit(1),
-    };
-
-    let game_dir = exe_path.parent().unwrap_or(Path::new("."));
-    let game_name = exe_name.replace(".exe", "");
-
-    // فحص المحرك: هل اللعبة تتطلب DirectX حديث؟
-    let is_heavy = is_heavy_game(&exe_path_raw);
-
-    // ==========================================
-    // 3. تطهير الكاش وإدارة السيف المركزي
-    // ==========================================
-    let _ = Command::new("rm").arg("-rf").arg(format!("{}/.cache/mesa_shader_cache", home)).status();
-    establish_central_save(&game_name, &home, &user);
-
-    // ==========================================
-    // 4. واجهة التحكم (VMAX Control Center)
-    // ==========================================
-    let gui = Command::new("zenity")
-    .args(&["--list", "--checklist", "--title=🛡️ Split Control Center vMAX",
-          "--column=Enable", "--column=Feature", "--width=450", "--height=350",
-          "TRUE", "Performance Overlay (MangoHud)",
-          "TRUE", "Zenith Performance (Gamemode)",
-          "TRUE", "Activate Dynamic ZRAM (Rubber Pipe)",
-          "TRUE", "Thermal Guard (Auto Undervolt)",
-          "FALSE", "Manual FPS Control (Limiter)", // معطل افتراضياً لتجارب الأداء الأقصى
-          "FALSE", "Force Vulkan Strict Mode (Intel)",
-          "FALSE", "Aggressive RAM Flush (Drop Caches)"])
-    .output().expect("Zenity failed");
-
-    let selection = String::from_utf8_lossy(&gui.stdout);
-    if selection.trim().is_empty() { process::exit(0); }
-
-    // نظام تحديد الفريمات الاختياري
-    let mut fps_limit = "0".to_string(); // 0 تعني غير محدود (Unlocked)
-    if selection.contains("Manual FPS Control") {
-        let fps_gui = Command::new("zenity")
-        .args(&["--list", "--radiolist", "--title=🎯 FPS Limiter", "--column=X", "--column=Limit",
-              "FALSE", "30", "TRUE", "60", "FALSE", "90", "FALSE", "120", "FALSE", "OFF"])
-        .output().expect("FPS failed");
-        let fps_sel = String::from_utf8_lossy(&fps_gui.stdout).trim().to_string();
-        if fps_sel != "OFF" && !fps_sel.is_empty() {
-            fps_limit = fps_sel;
-            vmax_log(&format!("FPS Limit set to: {}", fps_limit), &home);
+fn detect_gpu_vendor() -> GpuVendor {
+    let drm = "/sys/class/drm";
+    let Ok(entries) = fs::read_dir(drm) else { return GpuVendor::Generic };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if !name.starts_with("card") || name.contains('-') { continue; }
+        let p = format!("{}/{}/device/vendor", drm, name);
+        if let Ok(v) = fs::read_to_string(&p) {
+            return match v.trim() {
+                "0x8086" => GpuVendor::Intel,
+                "0x1002" => GpuVendor::Amd,
+                "0x10de" => GpuVendor::Nvidia,
+                _        => GpuVendor::Generic,
+            };
         }
-    } else {
-        vmax_log("FPS Limit: UNLOCKED for maximum performance.", &home);
     }
+    GpuVendor::Generic
+}
 
-    // ==========================================
-    // 5. هندسة البيئة (Environment Logic)
-    // ==========================================
-    let gpu_vendor = detect_gpu_vendor();
-    let mut env_vars: Vec<(&str, String)> = vec![
-        ("WINEFSYNC", "1".to_string()),
-        ("DXVK_ASYNC", "1".to_string()),
-        ("vblank_mode", "0".to_string()),
-        ("DXVK_FRAME_RATE", fps_limit.clone()),
-    ];
-
-    if selection.contains("Performance Overlay") {
-        env_vars.push(("MANGOHUD", "1".to_string()));
-        // في المانجو هود، نضع الليمت فقط إذا لم يكن 0
-        let hud_cfg = if fps_limit != "0" {
-            format!("fps_limit={},cpu_temp,gpu_temp,ram,fps,vsync=0", fps_limit)
-        } else {
-            "cpu_temp,gpu_temp,ram,fps,vsync=0".to_string()
-        };
-        env_vars.push(("MANGOHUD_CONFIG", hud_cfg));
-    }
-
-    // استخدام is_heavy لتفعيل Vulkan الصارم للألعاب المتطلبة
-    match gpu_vendor.as_str() {
-        "intel" => {
-            env_vars.push(("MESA_LOADER_DRIVER_OVERRIDE", "iris".to_string()));
-            if is_heavy || selection.contains("Force Vulkan Strict Mode") {
-                let intel_id = get_intel_gpu_id(); // جلب المعرف الحقيقي للجهاز الحالي
-                if !intel_id.is_empty() {
-                    env_vars.push(("MESA_VK_DEVICE_SELECT", intel_id));
-                }
-                env_vars.push(("WINEDLLOVERRIDES", "d3d11,dxgi,d3d9=n,b".to_string()));
-            }
-        },
-        "amd" => {
-            env_vars.push(("MESA_LOADER_DRIVER_OVERRIDE", "radeonsi".to_string()));
-            env_vars.push(("RADV_PERFTEST", "aco".to_string())); // تحسين خاص بكروت AMD
-        },
-        "nvidia" => {
-            // إجبار الكرت على استخدام الطاقة الكاملة (Power Mizer)
-            env_vars.push(("__GL_GSYNC_ALLOWED", "1".to_string()));
-            env_vars.push(("__GL_MAX_FRAMES_ALLOWED", "1".to_string()));
-
-            // تقليل الـ Stuttering في ألعاب الـ OpenGL
-            env_vars.push(("__GL_THREADED_OPTIMIZATIONS", "1".to_string()));
-
-            // في Nvidia، تعريف الفولكان يتم تلقائياً عبر الملفات المثبتة في النظام
-            // لذا لا نحتاج لـ MESA_VK_DEVICE_SELECT
-            vmax_log("Nvidia Detected: Applying High-Performance Force-Sync.", &home);
-            if gpu_vendor == "nvidia" && is_heavy {
-                env_vars.push(("PROXY_NVAPI", "1".to_string()));
-                env_vars.push(("DXVK_ENABLE_NVAPI", "1".to_string()));
-            }
-        },
-        _ => { /* نترك النظام يختار التعريف الافتراضي للبقية */ }
-    }
-
-    // ==========================================
-    // 6. إدارة العتاد (Hardware Level)
-    // ==========================================
-
-    if selection.contains("Thermal Guard") {
-        let home_clone = home.clone();
-        thread::spawn(move || {
-            active_thermal_guard(&home_clone);
-        });
-    }
-
-    if selection.contains("Activate Dynamic ZRAM") {
-        if let Ok(mem_info) = fs::read_to_string("/proc/meminfo") {
-            if let Some(total_kb) = mem_info.lines().find(|l| l.contains("MemTotal")).and_then(|l| l.split_whitespace().nth(1)) {
-                if let Ok(kb) = total_kb.parse::<u64>() {
-                    let zram_size_mb = (kb / 1024) / 4;
-                    let _ = Command::new("pkexec").args(&["zramctl", "--find", "--size", &format!("{}M", zram_size_mb)]).status();
+fn detect_vram_mb() -> u64 {
+    let drm = "/sys/class/drm";
+    if let Ok(entries) = fs::read_dir(drm) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("card") || name.contains('-') { continue; }
+            let p = format!("{}/{}/device/mem_info_vram_total", drm, name);
+            if let Ok(v) = fs::read_to_string(&p) {
+                if let Ok(b) = v.trim().parse::<u64>() {
+                    if b > 0 { return b / (1024 * 1024); }
                 }
             }
         }
     }
+    let ram = detect_ram_mb();
+    if ram >= 16384 { 1024 } else if ram >= 8192 { 512 } else { 256 }
+}
 
-    if selection.contains("Aggressive RAM Flush") {
-        let _ = Command::new("pkexec").arg("sh").arg("-c").arg("echo 3 > /proc/sys/vm/drop_caches").status();
-    }
-
-    // ==========================================
-    // 7. إطلاق المحرك
-    // ==========================================
-    // ==========================================
-    // 7. إطلاق المحرك
-    // ==========================================
-    let mut cmd_chain = Vec::new();
-    if selection.contains("Zenith Performance") { cmd_chain.push("gamemoderun"); }
-    if selection.contains("Performance Overlay") { cmd_chain.push("mangohud"); cmd_chain.push("--dlsym"); }
-    cmd_chain.push("wine");
-    cmd_chain.push(exe_name);
-
-    let mut final_cmd = Command::new(cmd_chain[0]);
-    if cmd_chain.len() > 1 { final_cmd.args(&cmd_chain[1..]); }
-
-    // --- الإضافة هنا لاستخدام game_dir ---
-    final_cmd.current_dir(game_dir);
-
-    println!("🔥 Split VMAX: Launching {} | Target FPS: {}", game_name, if fps_limit == "0" { "MAX/UNLOCKED" } else { &fps_limit });
-    let _ = final_cmd.envs(env_vars).status();
-
-// --- وظائف الأنظمة الفرعية ---
-
-fn is_heavy_game(path: &str) -> bool {
-    if let Ok(mut file) = fs::File::open(path) {
-        let mut buffer = vec![0; 1024 * 1024];
-        if let Ok(n) = file.read(&mut buffer) {
-            let content = String::from_utf8_lossy(&buffer[..n]);
-            // فحص وجود مكتبات DirectX 11/12
-            return content.contains("d3d11") || content.contains("d3d12");
+fn detect_is_igpu() -> bool {
+    let drm = "/sys/class/drm";
+    let Ok(entries) = fs::read_dir(drm) else { return true };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("card") || name.contains('-') { continue; }
+        let vp = format!("{}/{}/device/vendor", drm, name);
+        let cp = format!("{}/{}/device/class",  drm, name);
+        if let (Ok(v), Ok(c)) = (fs::read_to_string(&vp), fs::read_to_string(&cp)) {
+            if v.trim() == "0x8086" && c.trim().starts_with("0x0300") { return true; }
+            if c.trim() == "0x030000" { return true; }
         }
     }
     false
 }
 
-fn establish_central_save(game_name: &str, home: &str, user: &str) {
-    let wine_prefix = env::var("WINEPREFIX").unwrap_or_else(|_| format!("{}/.wine", home));
-    let central_base = format!("{}/Documents/Split_Saves/{}", home, game_name);
-    let paths = vec![
-        (format!("{}/Documents", central_base), format!("{}/drive_c/users/{}/Documents", wine_prefix, user)),
-        (format!("{}/AppData", central_base), format!("{}/drive_c/users/{}/AppData/Roaming", wine_prefix, user)),
-    ];
-    for (central, wine_path) in paths {
-        let _ = fs::create_dir_all(&central);
-        let wp = Path::new(&wine_path);
-        if wp.exists() && !fs::symlink_metadata(wp).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
-            let _ = Command::new("cp").arg("-r").arg(format!("{}/.", wine_path)).arg(&central).status();
-            let _ = fs::remove_dir_all(wp);
-        }
-        if !wp.exists() { let _ = symlink(&central, wp); }
-    }
+fn detect_cpu_threads() -> u32 {
+    fs::read_to_string("/proc/cpuinfo")
+    .map(|c| c.lines().filter(|l| l.starts_with("processor")).count() as u32)
+    .unwrap_or(2)
 }
 
-fn active_thermal_guard(home: &str) {
-    let mut is_undervolted = false;
-    loop {
-        if let Ok(out) = Command::new("sensors").output() {
-            let data = String::from_utf8_lossy(&out.stdout);
-            if data.contains("+85.0°C") || data.contains("+90.0°C") {
-                if !is_undervolted {
-                    vmax_log("🔥 Thermal Spike! Applying Silent Undervolt.", home);
-                    let _ = Command::new("pkexec").arg("intel-undervolt").arg("apply").status();
-                    is_undervolted = true;
-                }
-            } else if data.contains("+70.0°C") {
-                is_undervolted = false;
+fn detect_cpu_mhz() -> u32 {
+    fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+    .ok().and_then(|s| s.trim().parse::<u32>().ok())
+    .map(|k| k / 1000).unwrap_or(2000)
+}
+
+fn detect_ram_mb() -> u64 {
+    fs::read_to_string("/proc/meminfo").ok()
+    .and_then(|c| c.lines().find(|l| l.starts_with("MemTotal:"))
+    .and_then(|l| l.split_whitespace().nth(1))
+    .and_then(|v| v.parse::<u64>().ok())
+    .map(|k| k / 1024))
+    .unwrap_or(4096)
+}
+
+fn detect_ram_free_mb() -> u64 {
+    fs::read_to_string("/proc/meminfo").ok()
+    .and_then(|c| c.lines().find(|l| l.starts_with("MemAvailable:"))
+    .and_then(|l| l.split_whitespace().nth(1))
+    .and_then(|v| v.parse::<u64>().ok())
+    .map(|k| k / 1024))
+    .unwrap_or(2048)
+}
+
+fn read_gpu_freq_mhz() -> Option<u32> {
+    for p in &[
+        "/sys/class/drm/card0/gt/gt0/rps_cur_freq_mhz",
+        "/sys/class/drm/card1/gt/gt0/rps_cur_freq_mhz",
+    ] {
+        if let Ok(v) = fs::read_to_string(p) {
+            if let Ok(n) = v.trim().parse::<u32>() { return Some(n); }
+        }
+    }
+    None
+}
+
+fn read_cpu_temp() -> Option<u32> {
+    for p in &[
+        "/sys/class/thermal/thermal_zone0/temp",
+        "/sys/class/thermal/thermal_zone1/temp",
+    ] {
+        if let Ok(v) = fs::read_to_string(p) {
+            if let Ok(t) = v.trim().parse::<u32>() { return Some(t / 1000); }
+        }
+    }
+    None
+}
+
+fn get_hw(home: &str) -> HwInfo {
+    let path = format!("{}/.config/split/hw.cache", home);
+    if let Ok(meta) = fs::metadata(&path) {
+        if let Ok(modified) = meta.modified() {
+            let age = SystemTime::now().duration_since(modified)
+            .unwrap_or_default().as_secs();
+            if age < 7 * 24 * 3600 {
+                if let Some(hw) = load_hw_cache(&path) { return hw; }
             }
         }
-        thread::sleep(Duration::from_secs(30));
+    }
+    let hw = detect_hw();
+    save_hw_cache(&hw, &path);
+    hw
+}
+
+fn load_hw_cache(path: &str) -> Option<HwInfo> {
+    let content = fs::read_to_string(path).ok()?;
+    let get = |key: &str| -> String {
+        content.lines().find(|l| l.starts_with(key))
+        .and_then(|l| l.split('=').nth(1))
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .unwrap_or_default()
+    };
+    Some(HwInfo {
+        gpu_vendor: match get("gpu_vendor").as_str() {
+            "Intel"  => GpuVendor::Intel,
+            "Amd"    => GpuVendor::Amd,
+            "Nvidia" => GpuVendor::Nvidia,
+            _        => GpuVendor::Generic,
+        },
+         vram_mb:     get("vram_mb").parse().ok()?,
+         is_igpu:     get("is_igpu") == "true",
+         cpu_threads: get("cpu_threads").parse().ok()?,
+         cpu_mhz:     get("cpu_mhz").parse().ok()?,
+         ram_mb:      get("ram_mb").parse().ok()?,
+    })
+}
+
+fn save_hw_cache(hw: &HwInfo, path: &str) {
+    if let Some(p) = Path::new(path).parent() { let _ = fs::create_dir_all(p); }
+    let _ = fs::write(path, format!(
+        "gpu_vendor  = \"{:?}\"\nvram_mb     = {}\nis_igpu     = {}\n\
+cpu_threads = {}\ncpu_mhz     = {}\nram_mb      = {}\n",
+hw.gpu_vendor, hw.vram_mb, hw.is_igpu,
+hw.cpu_threads, hw.cpu_mhz, hw.ram_mb,
+    ));
+}
+
+fn classify(hw: &HwInfo) -> Profile {
+    if hw.is_igpu || hw.vram_mb < 2048 || hw.ram_mb < 6144 { return Profile::Potato; }
+    if hw.vram_mb >= 8192 && hw.ram_mb >= 16384 { return Profile::High; }
+    Profile::Mid
+}
+
+// ─────────────────────────────────────────────
+// THERMAL GUARD
+// ─────────────────────────────────────────────
+
+fn start_thermal_guard(home: &str) -> std::sync::mpsc::Sender<()> {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let h = home.to_string();
+    std::thread::spawn(move || {
+        loop {
+            if rx.try_recv().is_ok() { break; }
+            let temp = fs::read_to_string("/sys/class/thermal/thermal_zone0/temp")
+            .ok().and_then(|s| s.trim().parse::<u32>().ok()).map(|t| t / 1000);
+            if let Some(t) = temp {
+                if t >= 82 {
+                    log(&format!("Thermal: {}°C", t), &h);
+                    let _ = Command::new("intel-undervolt").arg("apply").status();
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(15));
+        }
+    });
+    tx
+}
+
+// ─────────────────────────────────────────────
+// CRACK DETECTION
+// ─────────────────────────────────────────────
+
+fn is_cracked(game_dir: &Path) -> bool {
+    ["CPY.ini", "CODEX.ini", "SKIDROW.ini", "ALI213.ini", "cream_api.ini"]
+    .iter().any(|f| game_dir.join(f).exists())
+    || game_dir.join("steam_api64.dll").exists()
+    || game_dir.join("steam_api.dll").exists()
+}
+
+// ─────────────────────────────────────────────
+// PATH HELPERS
+// ─────────────────────────────────────────────
+
+fn find_steam_root(home: &str) -> String {
+    let candidates = [
+        format!("{}/.local/share/Steam", home),
+            format!("{}/.steam/steam", home),
+                "/usr/share/steam".to_string(),
+                format!("{}/.var/app/com.valvesoftware.Steam/data/Steam", home),
+    ];
+    for p in &candidates {
+        if Path::new(&format!("{}/steamapps", p)).exists()
+            || Path::new(&format!("{}/compatibilitytools.d", p)).exists() {
+                return p.clone();
+            }
+    }
+    candidates[0].clone()
+}
+
+fn find_proton(steam_root: &str) -> String {
+    let candidates = [
+        "/usr/share/steam/compatibilitytools.d/proton-cachyos/proton".to_string(),
+        "/usr/share/steam/compatibilitytools.d/proton-cachyos-slr/proton".to_string(),
+        format!("{}/compatibilitytools.d/proton-cachyos/proton", steam_root),
+    ];
+    for p in &candidates {
+        if Path::new(p).exists() { return p.clone(); }
+    }
+    if let Ok(o) = Command::new("find")
+        .args(["/usr/share/steam", "-name", "proton", "-type", "f", "-maxdepth", "5"])
+        .output()
+        {
+            if let Some(line) = String::from_utf8_lossy(&o.stdout).lines().next() {
+                return line.trim().to_string();
+            }
+        }
+        "proton".to_string()
+}
+
+fn find_wine() -> String {
+    for bin in &["wine", "wine-staging", "wine-stable"] {
+        if Command::new("which").arg(bin).output()
+            .map(|o| o.status.success()).unwrap_or(false) {
+                return bin.to_string();
+            }
+    }
+    "wine".to_string()
+}
+
+// ─────────────────────────────────────────────
+// DESKTOP INTEGRATION (لجعل Split المشغل الافتراضي)
+// ─────────────────────────────────────────────
+
+fn integrate(home: &str) {
+    let dir = format!("{}/.local/share/applications", home);
+    let _ = fs::create_dir_all(&dir);
+    let _ = fs::write(format!("{}/split.desktop", dir),
+                      "[Desktop Entry]\nType=Application\nName=Split\n\
+Exec=split \"%f\"\nMimeType=application/x-ms-dos-executable;\n\
+NoDisplay=true\nTerminal=false\n");
+    let _ = Command::new("xdg-mime")
+    .args(["default", "split.desktop", "application/x-ms-dos-executable"])
+    .status();
+    println!("✅ Split set as default .exe handler");
+}
+
+// ─────────────────────────────────────────────
+// EXTRACT ICON FROM GAME FOLDER
+// ─────────────────────────────────────────────
+
+fn find_game_icon(game_dir: &Path, game_name: &str, home: &str) -> Option<String> {
+    // أسماء الملفات المحتملة للأيقونة
+    let candidates = ["icon.png", "logo.png", "game.ico", "icon.jpg", "icon.jpeg", "Icon.png"];
+    let cache_dir = format!("{}/.cache/split/icons", home);
+    let _ = fs::create_dir_all(&cache_dir);
+
+    for cand in candidates {
+        let icon_path = game_dir.join(cand);
+        if icon_path.exists() {
+            // إذا كان الملف .ico، نحاول تحويله إلى .png
+            if cand.ends_with(".ico") {
+                let output_png = format!("{}/{}.png", cache_dir, game_name);
+                if Command::new("convert")
+                    .arg(&icon_path)
+                    .arg(&output_png)
+                    .status()
+                    .is_ok()
+                    {
+                        return Some(output_png);
+                    } else {
+                        eprintln!("⚠️ Could not convert ico to png, using default icon");
+                        continue;
+                    }
+            } else {
+                // نسخ الملف إلى ذاكرة التخزين المؤقت
+                let dest = format!("{}/{}.png", cache_dir, game_name);
+                let _ = fs::copy(&icon_path, &dest);
+                return Some(dest);
+            }
+        }
+    }
+    None // لا توجد أيقونة
+}
+
+// ─────────────────────────────────────────────
+// ADD GAME TO APPLICATION MENU (START MENU)
+// ─────────────────────────────────────────────
+
+fn add_to_application_menu(exe_path: &Path, game_name: &str, home: &str) {
+    let apps_dir = format!("{}/.local/share/applications", home);
+    let _ = fs::create_dir_all(&apps_dir);
+    let desktop_file = format!("{}/{}.desktop", apps_dir, game_name.replace(' ', "_").replace('/', "_"));
+
+    // البحث عن أيقونة
+    let game_dir = exe_path.parent().unwrap_or(Path::new(""));
+    let icon_path = find_game_icon(game_dir, game_name, home);
+
+    let icon_line = match icon_path {
+        Some(path) => format!("Icon={}", path),
+        None => "Icon=application-x-ms-dos-executable".to_string(),
+    };
+
+    let exec_line = format!("Exec=split \"{}\"", exe_path.display());
+    let content = format!(
+        "[Desktop Entry]\n\
+Type=Application\n\
+Name={}\n\
+{}\n\
+{}\n\
+Terminal=false\n\
+Categories=Game;\n",
+game_name, exec_line, icon_line
+    );
+
+    match fs::write(&desktop_file, content) {
+        Ok(_) => println!("✅ Game added to Application Menu: {}", game_name),
+        Err(e) => eprintln!("❌ Failed to add to menu: {}", e),
+    }
+}
+
+// ─────────────────────────────────────────────
+// MAIN
+// ─────────────────────────────────────────────
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let home = env::var("HOME").expect("HOME not set");
+    let user = env::var("USER").expect("USER not set");
+
+    match args.get(1).map(|s| s.as_str()) {
+        Some("integrate") => { integrate(&home); return; }
+        Some("update") => {
+            let _ = Command::new("sh").arg("-c")
+            .arg("cargo build --release && \
+BIN=$(find target/release -maxdepth 1 -type f -executable ! -name '*.so' | head -1) && \
+pkexec install -m755 \"$BIN\" /usr/local/bin/split && echo '✅ Updated'")
+            .status();
+            return;
+        }
+        Some("info") => {
+            let hw      = get_hw(&home);
+            let profile = classify(&hw);
+            let free    = detect_ram_free_mb();
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            println!("  Split — System Info");
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            println!("  GPU:     {:?}{}", hw.gpu_vendor,
+                     if hw.is_igpu { " (integrated)" } else { "" });
+            println!("  VRAM:    {} MB", hw.vram_mb);
+            if let Some(f) = read_gpu_freq_mhz() { println!("  GPU MHz: {} (live)", f); }
+            println!("  CPU:     {} threads @ {} MHz", hw.cpu_threads, hw.cpu_mhz);
+            println!("  RAM:     {} MB / {} MB free", hw.ram_mb, free);
+            if let Some(t) = read_cpu_temp() { println!("  Temp:    {}°C (live)", t); }
+            println!("  Profile: {:?}", profile);
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            return;
+        }
+        _ => {}
     }
 
-}
+    let raw = args.iter().skip(1).find(|a| a.ends_with(".exe")).cloned()
+    .unwrap_or_else(|| {
+        eprintln!("Usage: split <game.exe> | split info | split integrate | split update");
+        std::process::exit(1);
+    });
+
+    let exe_path = match fs::canonicalize(&raw) {
+        Ok(p)  => p,
+        Err(e) => { eprintln!("❌ Bad path: {}", e); std::process::exit(1); }
+    };
+
+    let exe_name = exe_path.file_name().unwrap().to_str().unwrap().to_string();
+    let game_dir = exe_path.parent().unwrap().to_path_buf();
+    let game_tag = exe_name.replace(".exe", "").replace(' ', "_").to_lowercase();
+
+    let hw      = get_hw(&home);
+    let profile = classify(&hw);
+    log(&format!("=== {} | {:?} | {:?} ===", exe_name, profile, hw.gpu_vendor), &home);
+
+    let has_mangohud  = Path::new("/usr/bin/mangohud").exists();
+    let has_undervolt = Path::new("/usr/bin/intel-undervolt").exists();
+
+    let mut gui: Vec<String> = vec![
+        "--list".into(), "--checklist".into(),
+        format!("--title=Split [{:?}]", profile),
+            "--column=".into(), "--column=Option".into(),
+            "--width=480".into(), "--height=380".into(),
+    ];
+    if has_mangohud  { gui.extend(["TRUE".into(),  "MangoHud Overlay".into()]); }
+    if has_undervolt { gui.extend(["TRUE".into(),  "Thermal Guard".into()]); }
+    gui.extend(["FALSE".into(), "Force OpenGL (WineD3D)".into()]);
+    gui.extend(["FALSE".into(), "Use Wine instead of Proton".into()]);
+    gui.extend(["FALSE".into(), "Add to Application Menu (Start Menu)".into()]); // الخيار الجديد
+
+    let sel = Command::new("zenity").args(&gui).output()
+    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+    .unwrap_or_default();
+
+    if sel.trim().is_empty() { log("Cancelled", &home); return; }
+
+    // إضافة اللعبة إلى قائمة ابدأ إذا طلب المستخدم
+    if sel.contains("Add to Application Menu") {
+        let game_display_name = exe_name.replace(".exe", "");
+        add_to_application_menu(&exe_path, &game_display_name, &home);
+    }
+
+    let steam_root = find_steam_root(&home);
+    let prefix     = format!("{}/.local/share/split_data/{}", home, game_tag);
+    let _ = fs::create_dir_all(&prefix);
+
+    let cracked  = is_cracked(&game_dir);
+    let use_wine = sel.contains("Use Wine instead of Proton") || cracked;
+
+    let dst_drive = format!("{}/drive_c", prefix);
+    if !Path::new(&dst_drive).exists() {
+        let src_drive = format!("{}/.wine/drive_c", home);
+        if Path::new(&src_drive).exists() {
+            log("Copying ~/.wine/drive_c to new prefix (first run)...", &home);
+            let _ = Command::new("cp").args(["-r", &src_drive, &prefix]).status();
+            log("Prefix ready", &home);
+        } else {
+            eprintln!("❌ ~/.wine not found. Please run 'winecfg' first.");
+            std::process::exit(1);
+        }
+    }
+
+    let thermal_tx = if sel.contains("Thermal Guard") && has_undervolt {
+        Some(start_thermal_guard(&home))
+    } else { None };
+
+    let mut env_vars = vec![
+        ("WINEPREFIX", prefix.as_str()),
+        ("MESA_LOADER_DRIVER_OVERRIDE", "iris"),
+        ("mesa_glthread", "true"),
+        ("vblank_mode", "0"),
+        ("WINEFSYNC", "1"),
+        ("WINEDLLOVERRIDES", "dxgi=n,b;d3d11=n,b"),
+    ];
+
+    if sel.contains("Force OpenGL") {
+        env_vars.retain(|(k, _)| *k != "WINEDLLOVERRIDES");
+        env_vars.push(("PROTON_USE_WINED3D", "1"));
+    }
+
+    if !use_wine {
+        env_vars.push(("STEAM_COMPAT_DATA_PATH", &prefix));
+        env_vars.push(("STEAM_COMPAT_CLIENT_INSTALL_PATH", &steam_root));
+    }
+
+    let mut cmd: Vec<String> = Vec::new();
+    if sel.contains("MangoHud") && has_mangohud {
+        cmd.push("mangohud".to_string());
+    }
+
+    if use_wine {
+        if cracked { log("Crack detected → Wine", &home); }
+        cmd.push(find_wine());
+        cmd.push(exe_name.clone());
+    } else {
+        let proton = find_proton(&steam_root);
+        log(&format!("Proton: {}", proton), &home);
+        cmd.push(proton);
+        cmd.push("run".to_string());
+        cmd.push(exe_path.to_string_lossy().to_string());
+    }
+
+    log(&format!("Launch: {}", cmd.join(" ")), &home);
+
+    let mut child = match Command::new(&cmd[0])
+    .args(&cmd[1..])
+    .current_dir(&game_dir)
+    .envs(env_vars)
+    .spawn()
+    {
+        Ok(c)  => c,
+        Err(e) => { log(&format!("Error: {}", e), &home); return; }
+    };
+
+    match child.wait() {
+        Ok(s)  => log(&format!("Exit: {}", s), &home),
+        Err(e) => log(&format!("Wait error: {}", e), &home),
+    }
+
+    if let Some(tx) = thermal_tx { let _ = tx.send(()); }
+    log(&format!("=== End: {} ===", exe_name), &home);
 }
